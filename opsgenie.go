@@ -18,7 +18,7 @@ var httpClient = &http.Client{
 }
 
 func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
-	url := apiURL + "/alerts?query=status:open&sort=createdAt&order=asc"
+	url := apiURL + "/alerts?query=status:open&limit=100&order=desc"
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
