@@ -1,4 +1,4 @@
-module github.com/masmovil/mm-monorepo/tools/swe/bubble-cli-test
+module github.com/masmovil/mm-monorepo/tools/swe/bubble-cli-test/prom-browser
 
 go 1.25.0
 
