@@ -142,6 +142,7 @@ func initialShieldModel() shieldModel {
 	ti := textinput.New()
 	ti.Placeholder = "type a shell command..."
 	ti.SetWidth(60)
+	ti.Focus()
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
