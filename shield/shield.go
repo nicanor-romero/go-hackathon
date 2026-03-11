@@ -451,7 +451,13 @@ func (m shieldModel) View() tea.View {
 
 			b.WriteString(riskBoxStyle.Render(boxContent.String()))
 			b.WriteString("\n\n")
-			b.WriteString(shHelpStyle.Render("y/⏎ ejecutar  •  c cambiar  •  esc cancelar"))
+			if m.analysis.risk == "MEDIUM" || m.analysis.risk == "HIGH" || m.analysis.risk == "CRITICAL" {
+				b.WriteString(shHelpStyle.Render("y/⏎ ejecutar  •  "))
+				b.WriteString(shSelectStyle.Render("c editar"))
+				b.WriteString(shHelpStyle.Render("  •  esc cancelar"))
+			} else {
+				b.WriteString(shHelpStyle.Render("y/⏎ ejecutar  •  c editar  •  esc cancelar"))
+			}
 		}
 
 	case shieldStateAnalyzingAlt:
