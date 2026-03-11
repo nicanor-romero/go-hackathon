@@ -23,11 +23,14 @@ import (
 type shieldState int
 
 const (
-	shieldStateInput     shieldState = iota
-	shieldStateAnalyzing             // spinner while Claude analyzes
-	shieldStateResult                // show risk analysis, wait for y/n
-	shieldStateExecuting             // spinner while command runs
-	shieldStateDone                  // show output (success or failure)
+	shieldStateIntro        shieldState = iota // welcome screen
+	shieldStateInput                           // type a command
+	shieldStateAnalyzing                       // spinner while Claude analyzes original
+	shieldStateResult                          // show risk analysis, wait for action
+	shieldStateAnalyzingAlt                    // spinner while Claude analyzes alternative
+	shieldStateResultAlt                       // show pre-analysis of selected alternative
+	shieldStateExecuting                       // spinner while command runs
+	shieldStateDone                            // show output (success or failure)
 )
 
 // ---------------------------------------------------------------------------
@@ -35,15 +38,17 @@ const (
 // ---------------------------------------------------------------------------
 
 type analysisMsg struct {
-	risk        string // "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
-	explanation string
-	warning     string
-	alternative string
-	err         error
+	risk         string   // "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+	explanation  string
+	warning      string
+	alternative  string
+	invalid      bool     // command looks wrong/has typos
+	alternatives []string // suggested corrections when invalid=true
+	err          error
 }
 
 type execMsg struct {
-	output string // combined stdout+stderr
+	output string
 	err    error
 }
 
@@ -56,14 +61,16 @@ type errorInterpMsg struct {
 // ---------------------------------------------------------------------------
 
 type shieldModel struct {
-	state       shieldState
-	input       textinput.Model
-	spinner     spinner.Model
-	command     string
-	analysis    analysisMsg
-	execOutput  string // stdout+stderr from the command
-	execErr     string // non-empty if command failed
-	errorInterp string // Claude's error explanation (populated async)
+	state        shieldState
+	input        textinput.Model
+	spinner      spinner.Model
+	command      string
+	analysis     analysisMsg
+	altCursor    int    // which alternative is selected
+	altAnalysis  analysisMsg
+	execOutput   string
+	execErr      string
+	errorInterp  string
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +87,9 @@ var (
 	shSuccessStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 	shErrorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 	shWarnStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	shSelectStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("51"))
+	shDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	shInvalidStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 )
 
 func riskColor(risk string) color.Color {
@@ -129,6 +139,17 @@ func parseAnalysis(text string) analysisMsg {
 			result.warning = strings.TrimSpace(strings.TrimPrefix(line, "WARNING:"))
 		case strings.HasPrefix(line, "ALTERNATIVE:"):
 			result.alternative = strings.TrimSpace(strings.TrimPrefix(line, "ALTERNATIVE:"))
+		case strings.HasPrefix(line, "INVALID:"):
+			val := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "INVALID:")))
+			result.invalid = val == "true" || val == "yes"
+		case strings.HasPrefix(line, "SUGGESTIONS:"):
+			raw := strings.TrimSpace(strings.TrimPrefix(line, "SUGGESTIONS:"))
+			for _, s := range strings.Split(raw, "|") {
+				s = strings.TrimSpace(s)
+				if s != "" && strings.ToLower(s) != "none" {
+					result.alternatives = append(result.alternatives, s)
+				}
+			}
 		}
 	}
 	return result
@@ -142,17 +163,16 @@ func initialShieldModel() shieldModel {
 	ti := textinput.New()
 	ti.Placeholder = "type a shell command..."
 	ti.SetWidth(60)
-	ti.Focus()
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
-	return shieldModel{state: shieldStateInput, input: ti, spinner: s}
+	return shieldModel{state: shieldStateIntro, input: ti, spinner: s}
 }
 
 func (m shieldModel) Init() tea.Cmd {
-	return tea.Batch(m.input.Focus(), m.spinner.Tick)
+	return m.spinner.Tick
 }
 
 // ---------------------------------------------------------------------------
@@ -168,8 +188,25 @@ func (m shieldModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 
+		case "esc":
+			switch m.state {
+			case shieldStateResult:
+				// Cancel — back to input, clear command
+				m.state = shieldStateInput
+				m.input.SetValue("")
+				return m, m.input.Focus()
+			case shieldStateResultAlt:
+				// Back to original result
+				m.state = shieldStateResult
+				return m, nil
+			}
+
 		case "enter":
 			switch m.state {
+			case shieldStateIntro:
+				m.state = shieldStateInput
+				return m, m.input.Focus()
+
 			case shieldStateInput:
 				command := strings.TrimSpace(m.input.Value())
 				if command == "" {
@@ -178,22 +215,70 @@ func (m shieldModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.command = command
 				m.state = shieldStateAnalyzing
 				return m, tea.Batch(m.spinner.Tick, analyzeCommand(command))
+
 			case shieldStateResult:
+				if m.analysis.invalid && len(m.analysis.alternatives) > 0 {
+					// Enter on result with invalid command selects the highlighted alternative
+					selected := m.analysis.alternatives[m.altCursor]
+					m.state = shieldStateAnalyzingAlt
+					return m, tea.Batch(m.spinner.Tick, analyzeCommandAsAlt(selected))
+				}
+				// Normal: execute original
 				m.state = shieldStateExecuting
 				return m, tea.Batch(m.spinner.Tick, executeCommand(m.command))
+
+			case shieldStateResultAlt:
+				// Execute the alternative
+				selected := m.altAnalysis.alternative
+				if selected == "" || strings.ToLower(selected) == "none" {
+					// fall back to the raw alt text
+					selected = m.analysis.alternatives[m.altCursor]
+				}
+				m.command = selected
+				m.state = shieldStateExecuting
+				return m, tea.Batch(m.spinner.Tick, executeCommand(selected))
 			}
 
 		case "y", "Y":
-			if m.state == shieldStateResult {
+			switch m.state {
+			case shieldStateResult:
+				if !m.analysis.invalid {
+					m.state = shieldStateExecuting
+					return m, tea.Batch(m.spinner.Tick, executeCommand(m.command))
+				}
+			case shieldStateResultAlt:
+				selected := m.analysis.alternatives[m.altCursor]
+				m.command = selected
 				m.state = shieldStateExecuting
-				return m, tea.Batch(m.spinner.Tick, executeCommand(m.command))
+				return m, tea.Batch(m.spinner.Tick, executeCommand(selected))
 			}
 
-		case "n", "N", "esc":
-			if m.state == shieldStateResult {
+		case "n", "N":
+			switch m.state {
+			case shieldStateResult, shieldStateResultAlt:
 				m.state = shieldStateInput
 				m.input.SetValue("")
 				return m, m.input.Focus()
+			}
+
+		case "c":
+			// Change — go back to input keeping the current command text
+			if m.state == shieldStateResult || m.state == shieldStateResultAlt {
+				m.state = shieldStateInput
+				m.input.SetValue(m.command)
+				return m, m.input.Focus()
+			}
+
+		case "up", "k":
+			if m.state == shieldStateResult && m.analysis.invalid && m.altCursor > 0 {
+				m.altCursor--
+			}
+
+		case "down", "j":
+			if m.state == shieldStateResult && m.analysis.invalid {
+				if m.altCursor < len(m.analysis.alternatives)-1 {
+					m.altCursor++
+				}
 			}
 
 		case "q":
@@ -209,8 +294,19 @@ func (m shieldModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case analysisMsg:
+		if msg.err != nil {
+			m.analysis = msg
+			m.state = shieldStateResult
+			return m, nil
+		}
 		m.analysis = msg
+		m.altCursor = 0
 		m.state = shieldStateResult
+		return m, nil
+
+	case altAnalysisMsg:
+		m.altAnalysis = analysisMsg(msg)
+		m.state = shieldStateResultAlt
 		return m, nil
 
 	case execMsg:
@@ -233,7 +329,7 @@ func (m shieldModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
 	case shieldStateInput:
 		m.input, cmd = m.input.Update(msg)
-	case shieldStateAnalyzing, shieldStateExecuting:
+	case shieldStateAnalyzing, shieldStateAnalyzingAlt, shieldStateExecuting:
 		m.spinner, cmd = m.spinner.Update(msg)
 	case shieldStateDone:
 		if m.execErr != "" && m.errorInterp == "" {
@@ -256,65 +352,155 @@ func (m shieldModel) View() tea.View {
 	b.WriteString("\n\n")
 
 	switch m.state {
+	case shieldStateIntro:
+		introBox := shBoxStyle.BorderForeground(lipgloss.Color("205"))
+		var intro strings.Builder
+		intro.WriteString(shNormalStyle.Width(56).Render(
+			"Antes de ejecutar cualquier comando, esta herramienta lo analiza con IA para detectar riesgos, errores y alternativas más seguras.",
+		))
+		intro.WriteString("\n\n")
+		intro.WriteString(shNormalStyle.Width(56).Render("  • Detecta comandos incorrectos o con typos"))
+		intro.WriteString("\n")
+		intro.WriteString(shNormalStyle.Width(56).Render("  • Sugiere alternativas y las pre-analiza"))
+		intro.WriteString("\n")
+		intro.WriteString(shNormalStyle.Width(56).Render("  • Muestra nivel de riesgo antes de ejecutar"))
+		b.WriteString(introBox.Render(intro.String()))
+		b.WriteString("\n\n")
+		b.WriteString(shHelpStyle.Render("⏎ comenzar  •  ctrl+c salir"))
+
 	case shieldStateInput:
-		b.WriteString(shLabelStyle.Render("Command:"))
+		b.WriteString(shLabelStyle.Render("Comando:"))
 		b.WriteString("\n")
 		b.WriteString(shInputStyle.Render(m.input.View()))
 		b.WriteString("\n\n")
 		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
-			b.WriteString(shHelpStyle.Render("⚠️  ANTHROPIC_AUTH_TOKEN not set — analysis will be skipped"))
+			b.WriteString(shHelpStyle.Render("⚠️  ANTHROPIC_AUTH_TOKEN no está definido — se omitirá el análisis"))
 			b.WriteString("\n\n")
 		}
-		b.WriteString(shHelpStyle.Render("⏎ analyze  •  ctrl+c quit"))
+		b.WriteString(shHelpStyle.Render("⏎ analizar  •  ctrl+c salir"))
 
 	case shieldStateAnalyzing:
 		b.WriteString(shNormalStyle.Render("$ " + m.command))
 		b.WriteString("\n\n")
 		b.WriteString(m.spinner.View())
 		b.WriteString(" ")
-		b.WriteString(shNormalStyle.Render("Analyzing with AI..."))
+		b.WriteString(shNormalStyle.Render("Analizando con IA..."))
 
 	case shieldStateResult:
 		b.WriteString(shNormalStyle.Render("$ " + m.command))
 		b.WriteString("\n")
 
-		riskBoxStyle := shBoxStyle.BorderForeground(riskColor(m.analysis.risk))
+		if m.analysis.invalid {
+			// Command looks wrong — show invalid notice + alternatives
+			invalidBox := shBoxStyle.BorderForeground(lipgloss.Color("196"))
+			var boxContent strings.Builder
+			boxContent.WriteString(shInvalidStyle.Render("⚠️  Comando incorrecto o con errores"))
+			boxContent.WriteString("\n\n")
+			boxContent.WriteString(shLabelStyle.Render("Problema detectado:"))
+			boxContent.WriteString("\n")
+			boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.explanation))
 
+			if len(m.analysis.alternatives) > 0 {
+				boxContent.WriteString("\n\n")
+				boxContent.WriteString(shLabelStyle.Render("💡 ¿Quisiste decir?"))
+				boxContent.WriteString("\n")
+				for i, alt := range m.analysis.alternatives {
+					if i == m.altCursor {
+						boxContent.WriteString(shSelectStyle.Render(fmt.Sprintf("  ▶ %s", alt)))
+					} else {
+						boxContent.WriteString(shDimStyle.Render(fmt.Sprintf("    %s", alt)))
+					}
+					boxContent.WriteString("\n")
+				}
+			}
+
+			b.WriteString(invalidBox.Render(boxContent.String()))
+			b.WriteString("\n\n")
+			if len(m.analysis.alternatives) > 0 {
+				b.WriteString(shHelpStyle.Render("↑/↓ seleccionar  •  ⏎ pre-analizar  •  c cambiar  •  esc cancelar"))
+			} else {
+				b.WriteString(shHelpStyle.Render("c cambiar  •  esc cancelar"))
+			}
+		} else {
+			// Valid command — show normal risk result
+			riskBoxStyle := shBoxStyle.BorderForeground(riskColor(m.analysis.risk))
+			var boxContent strings.Builder
+			boxContent.WriteString(
+				lipgloss.NewStyle().Bold(true).Foreground(riskColor(m.analysis.risk)).Render(
+					fmt.Sprintf("%s Riesgo: %s", riskIcon(m.analysis.risk), m.analysis.risk),
+				),
+			)
+			boxContent.WriteString("\n\n")
+			boxContent.WriteString(shLabelStyle.Render("¿Qué hace?"))
+			boxContent.WriteString("\n")
+			boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.explanation))
+
+			if m.analysis.warning != "" && strings.ToLower(m.analysis.warning) != "none" {
+				boxContent.WriteString("\n\n")
+				boxContent.WriteString(shWarnStyle.Render("⚠️  Advertencia:"))
+				boxContent.WriteString("\n")
+				boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.warning))
+			}
+
+			if m.analysis.alternative != "" && strings.ToLower(m.analysis.alternative) != "none" {
+				boxContent.WriteString("\n\n")
+				boxContent.WriteString(shLabelStyle.Render("💡 Alternativa más segura:"))
+				boxContent.WriteString("\n")
+				boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.alternative))
+			}
+
+			b.WriteString(riskBoxStyle.Render(boxContent.String()))
+			b.WriteString("\n\n")
+			b.WriteString(shHelpStyle.Render("y/⏎ ejecutar  •  c cambiar  •  esc cancelar"))
+		}
+
+	case shieldStateAnalyzingAlt:
+		selected := ""
+		if m.altCursor < len(m.analysis.alternatives) {
+			selected = m.analysis.alternatives[m.altCursor]
+		}
+		b.WriteString(shNormalStyle.Render("$ " + selected))
+		b.WriteString("\n\n")
+		b.WriteString(m.spinner.View())
+		b.WriteString(" ")
+		b.WriteString(shNormalStyle.Render("Pre-analizando sugerencia con IA..."))
+
+	case shieldStateResultAlt:
+		selected := m.analysis.alternatives[m.altCursor]
+		b.WriteString(shNormalStyle.Render("$ " + selected))
+		b.WriteString("\n")
+
+		previewBox := shBoxStyle.BorderForeground(lipgloss.Color("51"))
 		var boxContent strings.Builder
+		boxContent.WriteString(shSelectStyle.Render("🔍 Pre-análisis de la sugerencia"))
+		boxContent.WriteString("\n\n")
 		boxContent.WriteString(
-			lipgloss.NewStyle().Bold(true).Foreground(riskColor(m.analysis.risk)).Render(
-				fmt.Sprintf("%s Risk: %s", riskIcon(m.analysis.risk), m.analysis.risk),
+			lipgloss.NewStyle().Bold(true).Foreground(riskColor(m.altAnalysis.risk)).Render(
+				fmt.Sprintf("%s Riesgo: %s", riskIcon(m.altAnalysis.risk), m.altAnalysis.risk),
 			),
 		)
 		boxContent.WriteString("\n\n")
-		boxContent.WriteString(shLabelStyle.Render("What it does:"))
+		boxContent.WriteString(shLabelStyle.Render("¿Qué hace?"))
 		boxContent.WriteString("\n")
-		boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.explanation))
+		boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.altAnalysis.explanation))
 
-		if m.analysis.warning != "" && strings.ToLower(m.analysis.warning) != "none" {
+		if m.altAnalysis.warning != "" && strings.ToLower(m.altAnalysis.warning) != "none" {
 			boxContent.WriteString("\n\n")
-			boxContent.WriteString(shWarnStyle.Render("⚠️  Warning:"))
+			boxContent.WriteString(shWarnStyle.Render("⚠️  Advertencia:"))
 			boxContent.WriteString("\n")
-			boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.warning))
+			boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.altAnalysis.warning))
 		}
 
-		if m.analysis.alternative != "" && strings.ToLower(m.analysis.alternative) != "none" {
-			boxContent.WriteString("\n\n")
-			boxContent.WriteString(shLabelStyle.Render("💡 Safer alternative:"))
-			boxContent.WriteString("\n")
-			boxContent.WriteString(shNormalStyle.Width(58).Render("  " + m.analysis.alternative))
-		}
-
-		b.WriteString(riskBoxStyle.Render(boxContent.String()))
+		b.WriteString(previewBox.Render(boxContent.String()))
 		b.WriteString("\n\n")
-		b.WriteString(shHelpStyle.Render("y/⏎ execute  •  n/esc cancel"))
+		b.WriteString(shHelpStyle.Render("y/⏎ ejecutar  •  esc volver  •  n cancelar"))
 
 	case shieldStateExecuting:
 		b.WriteString(shNormalStyle.Render("$ " + m.command))
 		b.WriteString("\n\n")
 		b.WriteString(m.spinner.View())
 		b.WriteString(" ")
-		b.WriteString(shNormalStyle.Render("Running..."))
+		b.WriteString(shNormalStyle.Render("Ejecutando..."))
 
 	case shieldStateDone:
 		b.WriteString(shNormalStyle.Render("$ " + m.command))
@@ -323,7 +509,7 @@ func (m shieldModel) View() tea.View {
 		if m.execErr == "" {
 			output := m.execOutput
 			if output == "" {
-				output = "(no output)"
+				output = "(sin salida)"
 			} else {
 				lines := strings.Split(output, "\n")
 				if len(lines) > 10 {
@@ -334,7 +520,7 @@ func (m shieldModel) View() tea.View {
 			}
 			successBox := shBoxStyle.BorderForeground(lipgloss.Color("42"))
 			b.WriteString(successBox.Render(
-				shSuccessStyle.Render("✅ Output") + "\n" + shNormalStyle.Render(output),
+				shSuccessStyle.Render("✅ Salida") + "\n" + shNormalStyle.Render(output),
 			))
 		} else {
 			errLines := strings.Split(m.execOutput, "\n")
@@ -356,18 +542,18 @@ func (m shieldModel) View() tea.View {
 				b.WriteString("\n\n")
 				b.WriteString(m.spinner.View())
 				b.WriteString(" ")
-				b.WriteString(shNormalStyle.Render("Interpreting error..."))
+				b.WriteString(shNormalStyle.Render("Interpretando el error..."))
 			} else {
 				interpBox := shBoxStyle.BorderForeground(lipgloss.Color("205"))
 				b.WriteString(interpBox.Render(
-					shLabelStyle.Render("🤖 AI Explanation") + "\n\n" +
+					shLabelStyle.Render("🤖 Explicación IA") + "\n\n" +
 						shNormalStyle.Width(58).Render(m.errorInterp),
 				))
 			}
 		}
 
 		b.WriteString("\n\n")
-		b.WriteString(shHelpStyle.Render("r run another  •  q quit"))
+		b.WriteString(shHelpStyle.Render("r ejecutar otro  •  q salir"))
 	}
 
 	return tea.NewView(b.String())
@@ -403,14 +589,16 @@ func analyzeCommand(command string) tea.Cmd {
 		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
 			return analysisMsg{
 				risk:        "UNKNOWN",
-				explanation: "ANTHROPIC_AUTH_TOKEN not set.",
+				explanation: "ANTHROPIC_AUTH_TOKEN no está definido.",
 				warning:     "none",
 				alternative: "none",
 			}
 		}
 
 		client := newAnthropicClient()
-		prompt := fmt.Sprintf(`You are a shell command safety analyzer. Analyze the following command.
+		prompt := fmt.Sprintf(`You are a shell command safety analyzer. Analyze the following shell command.
+
+First, check if the command appears to be INVALID — for example, it contains typos, misspelled program names, wrong syntax, or doesn't make sense as a shell command.
 
 Command: %s
 
@@ -418,11 +606,13 @@ Respond ONLY in this exact format (no markdown, no extra text):
 RISK: LOW|MEDIUM|HIGH|CRITICAL
 EXPLANATION: <one sentence: what this command does>
 WARNING: <one sentence: what could go wrong, or "none">
-ALTERNATIVE: <safer equivalent, or "none">`, command)
+ALTERNATIVE: <safer equivalent command, or "none">
+INVALID: true|false
+SUGGESTIONS: <if INVALID=true: up to 3 corrected command variants separated by " | ", otherwise "none">`, command)
 
 		msg, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
 			Model:     defaultModel(),
-			MaxTokens: 256,
+			MaxTokens: 300,
 			Messages: []anthropic.MessageParam{
 				anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
 			},
@@ -434,6 +624,51 @@ ALTERNATIVE: <safer equivalent, or "none">`, command)
 			return analysisMsg{err: fmt.Errorf("empty response from Claude")}
 		}
 		return parseAnalysis(msg.Content[0].Text)
+	}
+}
+
+// altAnalysisMsg wraps analysisMsg so Update can distinguish it.
+type altAnalysisMsg analysisMsg
+
+func analyzeCommandAsAlt(command string) tea.Cmd {
+	return func() tea.Msg {
+		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
+			return altAnalysisMsg{
+				risk:        "UNKNOWN",
+				explanation: "ANTHROPIC_AUTH_TOKEN no está definido.",
+				warning:     "none",
+				alternative: "none",
+			}
+		}
+
+		client := newAnthropicClient()
+		prompt := fmt.Sprintf(`You are a shell command safety analyzer. Analyze this command briefly.
+
+Command: %s
+
+Respond ONLY in this exact format (no markdown, no extra text):
+RISK: LOW|MEDIUM|HIGH|CRITICAL
+EXPLANATION: <one sentence: what this command does>
+WARNING: <one sentence: what could go wrong, or "none">
+ALTERNATIVE: none
+INVALID: false
+SUGGESTIONS: none`, command)
+
+		msg, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+			Model:     defaultModel(),
+			MaxTokens: 200,
+			Messages: []anthropic.MessageParam{
+				anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+			},
+		})
+		if err != nil {
+			return altAnalysisMsg{err: err}
+		}
+		if len(msg.Content) == 0 {
+			return altAnalysisMsg{err: fmt.Errorf("empty response from Claude")}
+		}
+		parsed := parseAnalysis(msg.Content[0].Text)
+		return altAnalysisMsg(parsed)
 	}
 }
 
@@ -452,7 +687,7 @@ func executeCommand(command string) tea.Cmd {
 func interpretError(command, errOutput string) tea.Cmd {
 	return func() tea.Msg {
 		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
-			return errorInterpMsg{text: "Set ANTHROPIC_AUTH_TOKEN to get error explanations."}
+			return errorInterpMsg{text: "Define ANTHROPIC_AUTH_TOKEN para obtener explicaciones de errores."}
 		}
 
 		client := newAnthropicClient()
@@ -470,10 +705,10 @@ Error output:
 			},
 		})
 		if err != nil {
-			return errorInterpMsg{text: fmt.Sprintf("Could not interpret error: %v", err)}
+			return errorInterpMsg{text: fmt.Sprintf("No se pudo interpretar el error: %v", err)}
 		}
 		if len(msg.Content) == 0 {
-			return errorInterpMsg{text: "Empty response from Claude."}
+			return errorInterpMsg{text: "Respuesta vacía de Claude."}
 		}
 		return errorInterpMsg{text: msg.Content[0].Text}
 	}
