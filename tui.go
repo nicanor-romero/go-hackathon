@@ -31,6 +31,8 @@ const (
 
 // --- Messages ---
 
+type autoRefreshMsg struct{}
+
 type incidentsLoadedMsg struct {
 	incidents []Incident
 	err       error
@@ -127,6 +129,7 @@ type warModel struct {
 	incidents  []Incident
 	listCursor int
 	listOffset int
+	refreshing bool
 
 	// Incident detail
 	selected     *Incident
@@ -182,10 +185,17 @@ func initialWarModel(apiKey, apiURL, slackToken string) warModel {
 	}
 }
 
+func scheduleAutoRefresh() tea.Cmd {
+	return tea.Tick(10*time.Second, func(time.Time) tea.Msg {
+		return autoRefreshMsg{}
+	})
+}
+
 func (m warModel) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
 		m.loadIncidents(),
+		scheduleAutoRefresh(),
 	)
 }
 
@@ -208,14 +218,28 @@ func (m warModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case autoRefreshMsg:
+		m.refreshing = true
+		return m, tea.Batch(m.loadIncidents(), scheduleAutoRefresh())
+
 	case incidentsLoadedMsg:
+		m.refreshing = false
 		if msg.err != nil {
-			m.err = msg.err
-			m.state = stateIncidentList
+			// Only show error if we're on the loading/list screen
+			if m.state == stateLoading || m.state == stateIncidentList {
+				m.err = msg.err
+				m.state = stateIncidentList
+			}
 		} else {
 			m.incidents = msg.incidents
-			m.state = stateIncidentList
+			if m.state == stateLoading {
+				m.state = stateIncidentList
+			}
 			m.err = nil
+			// Clamp cursor if list shrank
+			if m.listCursor >= len(m.incidents) {
+				m.listCursor = max(0, len(m.incidents)-1)
+			}
 		}
 		return m, nil
 
@@ -287,8 +311,8 @@ func (m warModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Update spinner when loading
-	if m.state == stateLoading || m.state == stateFindPods {
+	// Update spinner when loading or refreshing
+	if m.state == stateLoading || m.state == stateFindPods || m.refreshing {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
@@ -612,7 +636,11 @@ func (m warModel) viewLoading() string {
 func (m warModel) viewIncidentList() string {
 	var b strings.Builder
 	b.WriteString("\n")
-	b.WriteString(titleStyle.Render("WAR Operator - Open Incidents"))
+	title := "WAR Operator - Open Incidents"
+	if m.refreshing {
+		title += "  " + m.spinner.View()
+	}
+	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\n\n")
 
 	if m.err != nil {
