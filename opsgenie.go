@@ -160,13 +160,10 @@ func fetchAlertDetail(apiKey, apiURL, alertID string) (*Incident, error) {
 
 func escalateAlert(apiKey, apiURL string, incident Incident, targetTeam string) error {
 	payload := map[string]interface{}{
-		"message":     fmt.Sprintf("[Escalated] %s", incident.Title),
-		"priority":    incident.Priority,
-		"description": fmt.Sprintf("Escalated from incident %s: %s", incident.ID, incident.Description),
-		"responders": []map[string]string{
-			{"type": "team", "name": targetTeam},
+		"responder": map[string]string{
+			"type": "team",
+			"name": targetTeam,
 		},
-		"details": incident.RawDetails,
 	}
 
 	body, err := json.Marshal(payload)
@@ -174,7 +171,8 @@ func escalateAlert(apiKey, apiURL string, incident Incident, targetTeam string) 
 		return fmt.Errorf("marshaling payload: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", apiURL+"/alerts", strings.NewReader(string(body)))
+	url := fmt.Sprintf("%s/alerts/%s/responders", apiURL, incident.ID)
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
