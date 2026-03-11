@@ -13,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	anthropic "github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 // ---------------------------------------------------------------------------
@@ -259,8 +260,8 @@ func (m shieldModel) View() tea.View {
 		b.WriteString("\n")
 		b.WriteString(shInputStyle.Render(m.input.View()))
 		b.WriteString("\n\n")
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			b.WriteString(shHelpStyle.Render("⚠️  ANTHROPIC_API_KEY not set — analysis will be skipped"))
+		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
+			b.WriteString(shHelpStyle.Render("⚠️  ANTHROPIC_AUTH_TOKEN not set — analysis will be skipped"))
 			b.WriteString("\n\n")
 		}
 		b.WriteString(shHelpStyle.Render("⏎ analyze  •  ctrl+c quit"))
@@ -372,21 +373,42 @@ func (m shieldModel) View() tea.View {
 }
 
 // ---------------------------------------------------------------------------
+// Claude helpers
+// ---------------------------------------------------------------------------
+
+func newAnthropicClient() anthropic.Client {
+	opts := []option.RequestOption{
+		option.WithAPIKey(os.Getenv("ANTHROPIC_AUTH_TOKEN")),
+	}
+	if baseURL := os.Getenv("ANTHROPIC_BASE_URL"); baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
+	}
+	return anthropic.NewClient(opts...)
+}
+
+func defaultModel() anthropic.Model {
+	if m := os.Getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"); m != "" {
+		return anthropic.Model(m)
+	}
+	return anthropic.ModelClaudeHaiku4_5_20251001
+}
+
+// ---------------------------------------------------------------------------
 // Claude commands
 // ---------------------------------------------------------------------------
 
 func analyzeCommand(command string) tea.Cmd {
 	return func() tea.Msg {
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
 			return analysisMsg{
 				risk:        "UNKNOWN",
-				explanation: "ANTHROPIC_API_KEY not set.",
+				explanation: "ANTHROPIC_AUTH_TOKEN not set.",
 				warning:     "none",
 				alternative: "none",
 			}
 		}
 
-		client := anthropic.NewClient()
+		client := newAnthropicClient()
 		prompt := fmt.Sprintf(`You are a shell command safety analyzer. Analyze the following command.
 
 Command: %s
@@ -398,7 +420,7 @@ WARNING: <one sentence: what could go wrong, or "none">
 ALTERNATIVE: <safer equivalent, or "none">`, command)
 
 		msg, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
-			Model:     anthropic.ModelClaudeHaiku4_5_20251001,
+			Model:     defaultModel(),
 			MaxTokens: 256,
 			Messages: []anthropic.MessageParam{
 				anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
@@ -428,11 +450,11 @@ func executeCommand(command string) tea.Cmd {
 
 func interpretError(command, errOutput string) tea.Cmd {
 	return func() tea.Msg {
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			return errorInterpMsg{text: "Set ANTHROPIC_API_KEY to get error explanations."}
+		if os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
+			return errorInterpMsg{text: "Set ANTHROPIC_AUTH_TOKEN to get error explanations."}
 		}
 
-		client := anthropic.NewClient()
+		client := newAnthropicClient()
 		prompt := fmt.Sprintf(`A shell command failed. Explain why and how to fix it in 2-3 plain sentences. Be direct and specific. Do not use markdown.
 
 Command: %s
@@ -440,7 +462,7 @@ Error output:
 %s`, command, errOutput)
 
 		msg, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
-			Model:     anthropic.ModelClaudeHaiku4_5_20251001,
+			Model:     defaultModel(),
 			MaxTokens: 256,
 			Messages: []anthropic.MessageParam{
 				anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
