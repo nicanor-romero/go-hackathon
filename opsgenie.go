@@ -49,12 +49,11 @@ func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
 
 	var result struct {
 		Data []struct {
-			ID          string            `json:"id"`
-			Message     string            `json:"message"`
-			Priority    string            `json:"priority"`
-			Description string            `json:"description"`
-			CreatedAt   time.Time         `json:"createdAt"`
-			Details     map[string]string `json:"details"`
+			ID        string    `json:"id"`
+			Message   string    `json:"message"`
+			Priority  string    `json:"priority"`
+			CreatedAt time.Time `json:"createdAt"`
+			Tags      []string  `json:"tags"`
 		} `json:"data"`
 	}
 
@@ -65,23 +64,11 @@ func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
 	var incidents []Incident
 	for _, a := range result.Data {
 		inc := Incident{
-			ID:          a.ID,
-			Title:       a.Message,
-			Priority:    a.Priority,
-			Description: a.Description,
-			StartTime:   a.CreatedAt,
-			RawDetails:  a.Details,
-		}
-		// Extract namespace, deployment, team from details (case-insensitive)
-		for k, v := range a.Details {
-			switch strings.ToLower(k) {
-			case "namespace":
-				inc.Namespace = v
-			case "deployment":
-				inc.Deployment = v
-			case "team":
-				inc.Team = v
-			}
+			ID:        a.ID,
+			Title:     a.Message,
+			Priority:  a.Priority,
+			StartTime: a.CreatedAt,
+			Tags:      a.Tags,
 		}
 		incidents = append(incidents, inc)
 	}
@@ -98,6 +85,77 @@ func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
 	})
 
 	return incidents, nil
+}
+
+func fetchAlertDetail(apiKey, apiURL, alertID string) (*Incident, error) {
+	url := apiURL + "/alerts/" + alertID
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Authorization", "GenieKey "+apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching alert detail: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpsGenie API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data struct {
+			ID          string            `json:"id"`
+			Message     string            `json:"message"`
+			Priority    string            `json:"priority"`
+			Description string            `json:"description"`
+			CreatedAt   time.Time         `json:"createdAt"`
+			Tags        []string          `json:"tags"`
+			Details     map[string]string `json:"details"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding alert detail: %w", err)
+	}
+
+	a := result.Data
+	inc := &Incident{
+		ID:          a.ID,
+		Title:       a.Message,
+		Priority:    a.Priority,
+		Description: a.Description,
+		StartTime:   a.CreatedAt,
+		Tags:        a.Tags,
+		RawDetails:  a.Details,
+	}
+
+	for k, v := range a.Details {
+		switch strings.ToLower(k) {
+		case "namespace":
+			inc.Namespace = v
+		case "deployment", "job_name":
+			if inc.Deployment == "" {
+				inc.Deployment = v
+			}
+		case "team", "receiver":
+			if inc.Team == "" {
+				inc.Team = v
+			}
+		case "cluster":
+			inc.Cluster = v
+		}
+	}
+
+	return inc, nil
 }
 
 func escalateAlert(apiKey, apiURL string, incident Incident, targetTeam string) error {

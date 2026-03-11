@@ -11,23 +11,55 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-func findPods(namespace, deployment string) ([]Pod, error) {
-	// Try label selector first
-	pods, err := findPodsByLabel(namespace, deployment)
+// resolveContext finds the kubectl context that matches the cluster value
+// from the alert details by checking against available contexts.
+func resolveContext(cluster string) (string, error) {
+	if cluster == "" {
+		return "", fmt.Errorf("no cluster specified in alert details")
+	}
+
+	cmd := exec.Command("kubectl", "config", "get-contexts", "-o", "name")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("listing kubectl contexts: %w", err)
+	}
+
+	contexts := strings.Split(strings.TrimSpace(string(output)), "\n")
+	clusterLower := strings.ToLower(cluster)
+
+	for _, ctx := range contexts {
+		if strings.Contains(strings.ToLower(ctx), clusterLower) {
+			return ctx, nil
+		}
+	}
+
+	return "", fmt.Errorf("no kubectl context found matching cluster %q", cluster)
+}
+
+func findPods(namespace, deployment, kubeContext string) ([]Pod, error) {
+	pods, err := findPodsByLabel(namespace, deployment, kubeContext)
 	if err == nil && len(pods) > 0 {
 		return pods, nil
 	}
 
-	// Fallback: match pods by name prefix
-	return findPodsByPrefix(namespace, deployment)
+	return findPodsByPrefix(namespace, deployment, kubeContext)
 }
 
-func findPodsByLabel(namespace, deployment string) ([]Pod, error) {
-	cmd := exec.Command("kubectl", "get", "pods",
+func kubectlArgs(kubeContext string, args ...string) []string {
+	if kubeContext != "" {
+		return append([]string{"--context", kubeContext}, args...)
+	}
+	return args
+}
+
+func findPodsByLabel(namespace, deployment, kubeContext string) ([]Pod, error) {
+	args := kubectlArgs(kubeContext,
+		"get", "pods",
 		"-n", namespace,
 		"-l", fmt.Sprintf("app=%s", deployment),
 		"-o", "json",
 	)
+	cmd := exec.Command("kubectl", args...)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -37,11 +69,13 @@ func findPodsByLabel(namespace, deployment string) ([]Pod, error) {
 	return parsePodList(output)
 }
 
-func findPodsByPrefix(namespace, deployment string) ([]Pod, error) {
-	cmd := exec.Command("kubectl", "get", "pods",
+func findPodsByPrefix(namespace, deployment, kubeContext string) ([]Pod, error) {
+	args := kubectlArgs(kubeContext,
+		"get", "pods",
 		"-n", namespace,
 		"-o", "json",
 	)
+	cmd := exec.Command("kubectl", args...)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -108,14 +142,16 @@ func parsePodList(data []byte) ([]Pod, error) {
 	return pods, nil
 }
 
-func streamLogs(ctx context.Context, namespace, podName string, logChan chan<- string) {
+func streamLogs(ctx context.Context, namespace, podName, kubeContext string, logChan chan<- string) {
 	defer close(logChan)
 
-	cmd := exec.CommandContext(ctx, "kubectl", "logs", "-f",
+	args := kubectlArgs(kubeContext,
+		"logs", "-f",
 		"-n", namespace,
 		podName,
 		"--tail=100",
 	)
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

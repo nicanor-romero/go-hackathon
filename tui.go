@@ -36,6 +36,11 @@ type incidentsLoadedMsg struct {
 	err       error
 }
 
+type alertDetailMsg struct {
+	incident *Incident
+	err      error
+}
+
 type escalateResultMsg struct{ err error }
 type podsFoundMsg struct {
 	pods []Pod
@@ -121,6 +126,7 @@ type warModel struct {
 	// Incident list
 	incidents  []Incident
 	listCursor int
+	listOffset int
 
 	// Incident detail
 	selected     *Incident
@@ -137,8 +143,10 @@ type warModel struct {
 	warChannelURL string
 
 	// Pods / Logs
-	pods      []Pod
-	podCursor int
+	kubeContext string
+	pods        []Pod
+	podCursor   int
+	podOffset   int
 	logLines  []string
 	logChan   chan string
 	logCancel context.CancelFunc
@@ -211,11 +219,35 @@ func (m warModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case alertDetailMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.state = stateIncidentList
+		} else {
+			m.selected = msg.incident
+			m.actionCursor = 0
+			m.state = stateIncidentDetail
+		}
+		return m, nil
+
 	case escalateResultMsg:
 		m.state = stateEscalateResult
 		m.escalateErr = msg.err
 		if msg.err == nil {
 			m.escalateResult = fmt.Sprintf("Escalated to team %q", m.teamInput.Value())
+		}
+		return m, nil
+
+	case contextResolvedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.state = stateIncidentDetail
+		} else {
+			m.kubeContext = msg.kubeContext
+			m.pods = msg.pods
+			m.podCursor = 0
+			m.podOffset = 0
+			m.state = statePodList
 		}
 		return m, nil
 
@@ -226,6 +258,7 @@ func (m warModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.pods = msg.pods
 			m.podCursor = 0
+			m.podOffset = 0
 			m.state = statePodList
 		}
 		return m, nil
@@ -307,6 +340,15 @@ func (m warModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m warModel) listVisibleLines() int {
+	// header(2) + footer(2) + margins
+	v := m.height - 5
+	if v < 3 {
+		v = 3
+	}
+	return v
+}
+
 func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q":
@@ -318,17 +360,25 @@ func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.listCursor > 0 {
 			m.listCursor--
+			if m.listCursor < m.listOffset {
+				m.listOffset = m.listCursor
+			}
 		}
 	case "down", "j":
 		if m.listCursor < len(m.incidents)-1 {
 			m.listCursor++
+			visible := m.listVisibleLines()
+			if m.listCursor >= m.listOffset+visible {
+				m.listOffset = m.listCursor - visible + 1
+			}
 		}
 	case "enter":
 		if len(m.incidents) > 0 {
 			inc := m.incidents[m.listCursor]
 			m.selected = &inc
 			m.actionCursor = 0
-			m.state = stateIncidentDetail
+			m.state = stateLoading
+			return m, tea.Batch(m.spinner.Tick, m.fetchDetailCmd(inc.ID))
 		}
 	}
 	return m, nil
@@ -384,16 +434,23 @@ func (m warModel) handleEscalateInputKey(key string, msg tea.KeyMsg) (tea.Model,
 }
 
 func (m warModel) handlePodListKey(key string) (tea.Model, tea.Cmd) {
+	visible := m.listVisibleLines()
 	switch key {
 	case "esc":
 		m.state = stateIncidentDetail
 	case "up", "k":
 		if m.podCursor > 0 {
 			m.podCursor--
+			if m.podCursor < m.podOffset {
+				m.podOffset = m.podCursor
+			}
 		}
 	case "down", "j":
 		if m.podCursor < len(m.pods)-1 {
 			m.podCursor++
+			if m.podCursor >= m.podOffset+visible {
+				m.podOffset = m.podCursor - visible + 1
+			}
 		}
 	case "enter":
 		if len(m.pods) > 0 {
@@ -404,7 +461,7 @@ func (m warModel) handlePodListKey(key string) (tea.Model, tea.Cmd) {
 			ctx, cancel := context.WithCancel(context.Background())
 			m.logCancel = cancel
 			m.state = stateLogStream
-			go streamLogs(ctx, pod.Namespace, pod.Name, m.logChan)
+			go streamLogs(ctx, pod.Namespace, pod.Name, m.kubeContext, m.logChan)
 			return m, waitForLogLine(m.logChan)
 		}
 	}
@@ -472,6 +529,13 @@ func (m *warModel) cancelLogs() {
 
 // --- Commands ---
 
+func (m warModel) fetchDetailCmd(alertID string) tea.Cmd {
+	return func() tea.Msg {
+		inc, err := fetchAlertDetail(m.opsgenieAPIKey, m.opsgenieAPIURL, alertID)
+		return alertDetailMsg{incident: inc, err: err}
+	}
+}
+
 func (m warModel) escalateCmd(team string) tea.Cmd {
 	return func() tea.Msg {
 		err := escalateAlert(m.opsgenieAPIKey, m.opsgenieAPIURL, *m.selected, team)
@@ -479,10 +543,20 @@ func (m warModel) escalateCmd(team string) tea.Cmd {
 	}
 }
 
+type contextResolvedMsg struct {
+	kubeContext string
+	pods        []Pod
+	err         error
+}
+
 func (m warModel) findPodsCmd() tea.Cmd {
 	return func() tea.Msg {
-		pods, err := findPods(m.selected.Namespace, m.selected.Deployment)
-		return podsFoundMsg{pods: pods, err: err}
+		kubeCtx, err := resolveContext(m.selected.Cluster)
+		if err != nil {
+			return podsFoundMsg{err: err}
+		}
+		pods, err := findPods(m.selected.Namespace, m.selected.Deployment, kubeCtx)
+		return contextResolvedMsg{kubeContext: kubeCtx, pods: pods, err: err}
 	}
 }
 
@@ -555,7 +629,19 @@ func (m warModel) viewIncidentList() string {
 		return b.String()
 	}
 
-	for i, inc := range m.incidents {
+	visible := m.listVisibleLines()
+	end := m.listOffset + visible
+	if end > len(m.incidents) {
+		end = len(m.incidents)
+	}
+
+	if m.listOffset > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... %d more above", m.listOffset)))
+		b.WriteString("\n")
+	}
+
+	for i := m.listOffset; i < end; i++ {
+		inc := m.incidents[i]
 		pStyle := priorityStyle(inc.Priority)
 		priority := pStyle.Render(fmt.Sprintf("[%s]", inc.Priority))
 		age := formatAge(inc.StartTime)
@@ -566,6 +652,11 @@ func (m warModel) viewIncidentList() string {
 		} else {
 			b.WriteString(regularStyle.Render(fmt.Sprintf("   %s %s", priority, inc.Title)))
 		}
+		b.WriteString("\n")
+	}
+
+	if end < len(m.incidents) {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... %d more below", len(m.incidents)-end)))
 		b.WriteString("\n")
 	}
 
@@ -600,6 +691,9 @@ func (m warModel) viewIncidentDetail() string {
 	detail.WriteString("\n")
 	detail.WriteString(labelStyle.Render("Team:       "))
 	detail.WriteString(regularStyle.Render(valueOr(inc.Team, "n/a")))
+	detail.WriteString("\n")
+	detail.WriteString(labelStyle.Render("Cluster:    "))
+	detail.WriteString(regularStyle.Render(valueOr(inc.Cluster, "n/a")))
 	detail.WriteString("\n")
 	detail.WriteString(labelStyle.Render("Started:    "))
 	detail.WriteString(regularStyle.Render(inc.StartTime.Format(time.RFC3339)))
@@ -687,15 +781,30 @@ func (m warModel) viewPodList() string {
 		return b.String()
 	}
 
-	for i, pod := range m.pods {
-		status := pod.Status
-		ready := pod.Ready
-		line := fmt.Sprintf("%s  [%s]  Ready: %s", pod.Name, status, ready)
+	visible := m.listVisibleLines()
+	end := m.podOffset + visible
+	if end > len(m.pods) {
+		end = len(m.pods)
+	}
+
+	if m.podOffset > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... %d more above", m.podOffset)))
+		b.WriteString("\n")
+	}
+
+	for i := m.podOffset; i < end; i++ {
+		pod := m.pods[i]
+		line := fmt.Sprintf("%s  [%s]  Ready: %s", pod.Name, pod.Status, pod.Ready)
 		if i == m.podCursor {
 			b.WriteString(selectedStyle.Render(fmt.Sprintf(" > %s", line)))
 		} else {
 			b.WriteString(regularStyle.Render(fmt.Sprintf("   %s", line)))
 		}
+		b.WriteString("\n")
+	}
+
+	if end < len(m.pods) {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... %d more below", len(m.pods)-end)))
 		b.WriteString("\n")
 	}
 
