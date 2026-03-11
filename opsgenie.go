@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+// httpClient that does not follow redirects (OpsGenie redirects to HTML login on bad auth)
+var httpClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
 	url := apiURL + "/alerts?query=status:open&sort=createdAt&order=asc"
 
@@ -19,15 +26,25 @@ func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
 	}
 	req.Header.Set("Authorization", "GenieKey "+apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching alerts: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("OpsGenie API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Guard against non-JSON responses (e.g. HTML error pages from proxies)
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		return nil, fmt.Errorf("OpsGenie returned unexpected content-type %q (status %d): %.200s", ct, resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -41,7 +58,7 @@ func fetchIncidents(apiKey, apiURL string) ([]Incident, error) {
 		} `json:"data"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
 
@@ -106,7 +123,7 @@ func escalateAlert(apiKey, apiURL string, incident Incident, targetTeam string) 
 	req.Header.Set("Authorization", "GenieKey "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("sending escalation: %w", err)
 	}

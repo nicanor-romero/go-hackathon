@@ -22,7 +22,7 @@ func main() {
 
 	apiURL := os.Getenv("OPSGENIE_API_URL")
 	if apiURL == "" {
-		apiURL = "https://api.eu.opsgenie.com/v2"
+		apiURL = "https://api.opsgenie.com/v2"
 	}
 
 	p := tea.NewProgram(
