@@ -1,93 +1,79 @@
-# Bubble Tea v2 Examples 🎨
+# 🛡️ Command Risk Shield
 
-Two complete TUI applications demonstrating Bubble Tea v2 capabilities.
+A terminal TUI that intercepts shell commands, asks Claude (Haiku) to rate their risk before execution, and automatically explains failures when a command goes wrong.
 
-## 📁 Project Structure
+## Prerequisites
 
-```
-bubble-cli-test/
-├── main.go           # Generic menu/submenu example (default)
-├── example.go        # Example implementation
-├── EXAMPLE.md        # Example documentation
-│
-└── prom-browser/     # Prometheus metrics browser
-    ├── main.go
-    ├── prom-tui.go
-    ├── prometheus.go
-    └── README.md
-```
+- Go 1.21+
+- An [Anthropic API key](https://console.anthropic.com/)
 
-## 🎯 Generic Menu/Submenu Example (Root Directory)
-
-A reusable template for building menu-based TUI applications.
-
-### Features
-- ✅ Main menu with 4 items
-- ✅ Submenu navigation (3 actions per item)
-- ✅ Loading state with spinner
-- ✅ Detail view with boxed content
-- ✅ Rainbow title animation
-- ✅ Same styling as prom-browser
-
-### Run
-```bash
-go build -o example-tui
-./example-tui
-```
-
-See [EXAMPLE.md](./EXAMPLE.md) for complete documentation and customization guide.
-
-## 🚀 Prometheus Metrics Browser (`prom-browser/`)
-
-Interactive TUI for browsing Prometheus metrics with advanced features.
-
-### Features
-- 🎨 Beautiful UI with colors and animations
-- 📊 Browse all available metrics
-- 🔍 Real-time filtering
-- 📋 Interactive submenu for each metric:
-  - 🏷️ **View Labels** - All available fields
-  - 📈 **View Statistics** - Min/Max/Avg, cardinality
-  - 📝 **PromQL Queries** - Ready-to-use Grafana queries
-- ⚠️ Smart metric type detection (summaries vs counters)
-
-### Run
-```bash
-cd prom-browser
-go build -o prom-metrics
-./prom-metrics
-```
-
-**Note:** Requires VPN connection to access Prometheus.
-
-See [prom-browser/README.md](./prom-browser/README.md) for details.
-
-## 📚 Libraries Used
-
-- **Bubble Tea v2** (`charm.land/bubbletea/v2` v2.0.2) - TUI framework
-- **Lip Gloss v2** (`charm.land/lipgloss/v2` v2.0.1) - Terminal styling
-- **Bubbles v2** (`charm.land/bubbles/v2` v2.0.0) - Pre-built components
-
-## 🎓 Learning Resources
-
-Both examples demonstrate:
-- State management patterns
-- Menu/submenu navigation
-- Keyboard event handling
-- Animation techniques
-- Async operations with spinners
-- Consistent styling with Lip Gloss
-
-Start with the generic example to learn the basics, then explore prom-browser for advanced patterns!
-
-## 🛠️ Development
-
-Both applications are independent Go modules with their own `go.mod` files.
+## Setup
 
 ```bash
-# Build generic example
-go build -o example-tui
-
-# Build Prometheus browser
-cd prom-browser && go build -o prom-metrics
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+The app works without the key but analysis will be skipped.
+
+## Build & Run
+
+```bash
+make all          # compiles → bin/shield
+make run          # build + launch immediately
+make clean        # remove bin/shield
+```
+
+Or run directly without building:
+
+```bash
+go run ./shield
+```
+
+## Usage
+
+```
+🛡️  Command Risk Shield
+
+Command:
+╭──────────────────────────────────────────────────────────╮
+│ type a shell command...                                  │
+╰──────────────────────────────────────────────────────────╯
+
+⏎ analyze  •  ctrl+c quit
+```
+
+1. **Type** any shell command and press `Enter`.
+2. Claude analyzes it and shows a risk card:
+
+| Level    | Color  | Meaning                                          |
+|----------|--------|--------------------------------------------------|
+| LOW      | green  | Routine read-only or safe operation              |
+| MEDIUM   | yellow | Writes files or modifies state                   |
+| HIGH     | orange | Potentially destructive or hard to reverse       |
+| CRITICAL | red    | Data loss, security risk, or system-wide damage  |
+
+3. **Confirm or cancel:**
+   - `y` or `Enter` — execute the command
+   - `n` or `Esc` — go back and edit
+
+4. **After execution:**
+   - Success → output shown (up to 10 lines)
+   - Failure → error shown + Claude explains why and how to fix it
+   - `r` — run another command
+   - `q` — quit
+
+## Keyboard Reference
+
+| Key           | State  | Action                    |
+|---------------|--------|---------------------------|
+| `Enter`       | Input  | Analyze command           |
+| `y` / `Enter` | Result | Execute                   |
+| `n` / `Esc`   | Result | Cancel, back to input     |
+| `r`           | Done   | Run another command       |
+| `q`           | Done   | Quit                      |
+| `Ctrl+C`      | Any    | Quit immediately          |
+
+## Limitations
+
+- Commands are split on whitespace — quoted arguments like `echo "hello world"` are not supported.
+- Requires a real TTY; does not work piped or in CI.
