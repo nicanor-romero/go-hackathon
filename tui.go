@@ -43,6 +43,10 @@ type alertDetailMsg struct {
 	err      error
 }
 
+type bulkDetailsMsg struct {
+	details map[string]*Incident // alertID -> full incident
+}
+
 type escalateResultMsg struct{ err error }
 type podsFoundMsg struct {
 	pods []Pod
@@ -131,6 +135,12 @@ type warModel struct {
 	listOffset int
 	refreshing bool
 
+	// Filters
+	filterActive         bool
+	filterTeamInput      textinput.Model
+	filterNamespaceInput textinput.Model
+	filterFocus          int // 0=team, 1=namespace
+
 	// Incident detail
 	selected     *Incident
 	actionCursor int
@@ -174,14 +184,26 @@ func initialWarModel(apiKey, apiURL, slackToken string) warModel {
 	wi.Prompt = "Channel suffix: "
 	wi.CharLimit = 64
 
+	ft := textinput.New()
+	ft.Placeholder = "filter by team..."
+	ft.Prompt = "Team: "
+	ft.CharLimit = 64
+
+	fn := textinput.New()
+	fn.Placeholder = "filter by namespace..."
+	fn.Prompt = "Namespace: "
+	fn.CharLimit = 64
+
 	return warModel{
-		state:          stateLoading,
-		opsgenieAPIKey: apiKey,
-		opsgenieAPIURL: apiURL,
-		slackBotToken:  slackToken,
-		spinner:        s,
-		teamInput:      ti,
-		warInput:       wi,
+		state:                stateLoading,
+		opsgenieAPIKey:       apiKey,
+		opsgenieAPIURL:       apiURL,
+		slackBotToken:        slackToken,
+		spinner:              s,
+		teamInput:            ti,
+		warInput:             wi,
+		filterTeamInput:      ft,
+		filterNamespaceInput: fn,
 	}
 }
 
@@ -230,15 +252,28 @@ func (m warModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = msg.err
 				m.state = stateIncidentList
 			}
-		} else {
-			m.incidents = msg.incidents
-			if m.state == stateLoading {
-				m.state = stateIncidentList
-			}
-			m.err = nil
-			// Clamp cursor if list shrank
-			if m.listCursor >= len(m.incidents) {
-				m.listCursor = max(0, len(m.incidents)-1)
+			return m, nil
+		}
+		m.incidents = msg.incidents
+		if m.state == stateLoading {
+			m.state = stateIncidentList
+		}
+		m.err = nil
+		// Clamp cursor if list shrank
+		filtered := m.filteredIncidents()
+		if m.listCursor >= len(filtered) {
+			m.listCursor = max(0, len(filtered)-1)
+		}
+		// Fetch details for all incidents to populate team/namespace for filtering
+		return m, m.fetchBulkDetailsCmd(msg.incidents)
+
+	case bulkDetailsMsg:
+		for i := range m.incidents {
+			if detail, ok := msg.details[m.incidents[i].ID]; ok {
+				m.incidents[i].Team = detail.Team
+				m.incidents[i].Namespace = detail.Namespace
+				m.incidents[i].Deployment = detail.Deployment
+				m.incidents[i].Cluster = detail.Cluster
 			}
 		}
 		return m, nil
@@ -329,6 +364,15 @@ func (m warModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.warInput, cmd = m.warInput.Update(msg)
 		return m, cmd
 	}
+	if m.state == stateIncidentList && m.filterActive {
+		var cmd tea.Cmd
+		if m.filterFocus == 0 {
+			m.filterTeamInput, cmd = m.filterTeamInput.Update(msg)
+		} else {
+			m.filterNamespaceInput, cmd = m.filterNamespaceInput.Update(msg)
+		}
+		return m, cmd
+	}
 
 	return m, nil
 }
@@ -344,6 +388,9 @@ func (m warModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch m.state {
 	case stateIncidentList:
+		if m.filterActive {
+			return m.handleFilterKey(key, msg)
+		}
 		return m.handleIncidentListKey(key)
 	case stateIncidentDetail:
 		return m.handleIncidentDetailKey(key)
@@ -367,6 +414,12 @@ func (m warModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m warModel) listVisibleLines() int {
 	// header(2) + footer(2) + margins
 	v := m.height - 5
+	hasFilters := m.filterTeamInput.Value() != "" || m.filterNamespaceInput.Value() != ""
+	if m.filterActive {
+		v -= 3
+	} else if hasFilters {
+		v -= 1
+	}
 	if v < 3 {
 		v = 3
 	}
@@ -374,6 +427,7 @@ func (m warModel) listVisibleLines() int {
 }
 
 func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
+	filtered := m.filteredIncidents()
 	switch key {
 	case "q":
 		return m, tea.Quit
@@ -381,6 +435,12 @@ func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
 		m.state = stateLoading
 		m.err = nil
 		return m, tea.Batch(m.spinner.Tick, m.loadIncidents())
+	case "f", "/":
+		m.filterActive = true
+		m.filterFocus = 0
+		m.listCursor = 0
+		m.listOffset = 0
+		return m, m.filterTeamInput.Focus()
 	case "up", "k":
 		if m.listCursor > 0 {
 			m.listCursor--
@@ -389,7 +449,7 @@ func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "down", "j":
-		if m.listCursor < len(m.incidents)-1 {
+		if m.listCursor < len(filtered)-1 {
 			m.listCursor++
 			visible := m.listVisibleLines()
 			if m.listCursor >= m.listOffset+visible {
@@ -397,8 +457,8 @@ func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "enter":
-		if len(m.incidents) > 0 {
-			inc := m.incidents[m.listCursor]
+		if len(filtered) > 0 {
+			inc := filtered[m.listCursor]
 			m.selected = &inc
 			m.actionCursor = 0
 			m.state = stateLoading
@@ -406,6 +466,46 @@ func (m warModel) handleIncidentListKey(key string) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m warModel) handleFilterKey(key string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc":
+		m.filterActive = false
+		m.filterTeamInput.Blur()
+		m.filterNamespaceInput.Blur()
+		return m, nil
+	case "enter":
+		m.filterActive = false
+		m.filterTeamInput.Blur()
+		m.filterNamespaceInput.Blur()
+		m.listCursor = 0
+		m.listOffset = 0
+		return m, nil
+	case "tab", "shift+tab":
+		if m.filterFocus == 0 {
+			m.filterFocus = 1
+			m.filterTeamInput.Blur()
+			return m, m.filterNamespaceInput.Focus()
+		}
+		m.filterFocus = 0
+		m.filterNamespaceInput.Blur()
+		return m, m.filterTeamInput.Focus()
+	}
+
+	// Update the focused input
+	var cmd tea.Cmd
+	if m.filterFocus == 0 {
+		m.filterTeamInput, cmd = m.filterTeamInput.Update(msg)
+	} else {
+		m.filterNamespaceInput, cmd = m.filterNamespaceInput.Update(msg)
+	}
+
+	// Reset cursor when filter changes
+	m.listCursor = 0
+	m.listOffset = 0
+
+	return m, cmd
 }
 
 func (m warModel) handleIncidentDetailKey(key string) (tea.Model, tea.Cmd) {
@@ -591,6 +691,19 @@ func (m warModel) createWarCmd(channelName string) tea.Cmd {
 	}
 }
 
+func (m warModel) fetchBulkDetailsCmd(incidents []Incident) tea.Cmd {
+	return func() tea.Msg {
+		details := make(map[string]*Incident)
+		for _, inc := range incidents {
+			detail, err := fetchAlertDetail(m.opsgenieAPIKey, m.opsgenieAPIURL, inc.ID)
+			if err == nil {
+				details[inc.ID] = detail
+			}
+		}
+		return bulkDetailsMsg{details: details}
+	}
+}
+
 // --- View ---
 
 func (m warModel) View() tea.View {
@@ -641,26 +754,65 @@ func (m warModel) viewIncidentList() string {
 		title += "  " + m.spinner.View()
 	}
 	b.WriteString(titleStyle.Render(title))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+
+	// Filter bar
+	filtered := m.filteredIncidents()
+	hasFilters := m.filterTeamInput.Value() != "" || m.filterNamespaceInput.Value() != ""
+
+	if m.filterActive {
+		b.WriteString("\n")
+		focusIndicator := func(focused bool) string {
+			if focused {
+				return selectedStyle.Render("▸ ")
+			}
+			return "  "
+		}
+		b.WriteString(focusIndicator(m.filterFocus == 0))
+		b.WriteString(m.filterTeamInput.View())
+		b.WriteString("\n")
+		b.WriteString(focusIndicator(m.filterFocus == 1))
+		b.WriteString(m.filterNamespaceInput.View())
+		b.WriteString("\n")
+		if hasFilters {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  Showing %d of %d incidents", len(filtered), len(m.incidents))))
+			b.WriteString("\n")
+		}
+	} else if hasFilters {
+		filters := []string{}
+		if v := m.filterTeamInput.Value(); v != "" {
+			filters = append(filters, fmt.Sprintf("team:%s", v))
+		}
+		if v := m.filterNamespaceInput.Value(); v != "" {
+			filters = append(filters, fmt.Sprintf("ns:%s", v))
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  Filters: %s (%d/%d)", strings.Join(filters, " "), len(filtered), len(m.incidents))))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 
 	if m.err != nil {
 		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("r refresh  •  q quit"))
+		b.WriteString(helpStyle.Render("r refresh  •  f filter  •  q quit"))
 		return b.String()
 	}
 
-	if len(m.incidents) == 0 {
-		b.WriteString(dimStyle.Render("  No open incidents. All clear!"))
+	if len(filtered) == 0 {
+		if hasFilters {
+			b.WriteString(dimStyle.Render("  No incidents match the current filters."))
+		} else {
+			b.WriteString(dimStyle.Render("  No open incidents. All clear!"))
+		}
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("r refresh  •  q quit"))
+		b.WriteString(helpStyle.Render("r refresh  •  f filter  •  q quit"))
 		return b.String()
 	}
 
 	visible := m.listVisibleLines()
 	end := m.listOffset + visible
-	if end > len(m.incidents) {
-		end = len(m.incidents)
+	if end > len(filtered) {
+		end = len(filtered)
 	}
 
 	if m.listOffset > 0 {
@@ -669,7 +821,7 @@ func (m warModel) viewIncidentList() string {
 	}
 
 	for i := m.listOffset; i < end; i++ {
-		inc := m.incidents[i]
+		inc := filtered[i]
 		pStyle := priorityStyle(inc.Priority)
 		priority := pStyle.Render(fmt.Sprintf("[%s]", inc.Priority))
 		age := formatAge(inc.StartTime)
@@ -683,13 +835,17 @@ func (m warModel) viewIncidentList() string {
 		b.WriteString("\n")
 	}
 
-	if end < len(m.incidents) {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... %d more below", len(m.incidents)-end)))
+	if end < len(filtered) {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... %d more below", len(filtered)-end)))
 		b.WriteString("\n")
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("j/k navigate  •  Enter select  •  r refresh  •  q quit"))
+	if m.filterActive {
+		b.WriteString(helpStyle.Render("Tab switch field  •  Enter apply  •  Esc close filter"))
+	} else {
+		b.WriteString(helpStyle.Render("j/k navigate  •  Enter select  •  f filter  •  r refresh  •  q quit"))
+	}
 
 	return b.String()
 }
@@ -914,6 +1070,29 @@ func (m warModel) viewWarResult() string {
 	b.WriteString("\n\n")
 	b.WriteString(helpStyle.Render("Enter/Esc to go back"))
 	return b.String()
+}
+
+// --- Filtering ---
+
+func (m warModel) filteredIncidents() []Incident {
+	teamFilter := strings.ToLower(strings.TrimSpace(m.filterTeamInput.Value()))
+	nsFilter := strings.ToLower(strings.TrimSpace(m.filterNamespaceInput.Value()))
+
+	if teamFilter == "" && nsFilter == "" {
+		return m.incidents
+	}
+
+	var filtered []Incident
+	for _, inc := range m.incidents {
+		if teamFilter != "" && !strings.Contains(strings.ToLower(inc.Team), teamFilter) {
+			continue
+		}
+		if nsFilter != "" && !strings.Contains(strings.ToLower(inc.Namespace), nsFilter) {
+			continue
+		}
+		filtered = append(filtered, inc)
+	}
+	return filtered
 }
 
 // --- Helpers ---
